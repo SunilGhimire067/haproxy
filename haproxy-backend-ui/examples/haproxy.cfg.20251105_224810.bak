@@ -147,7 +147,8 @@ backend qrbackend-esewa
         cookie JSESSIONID prefix
         server node16 10.19.222.81:80 cookie node13 check inter 2000
         #server node13 10.19.222.13:8080 cookie node13 check inter 2000
-        #server node33 10.19.222.33:8080 cookie node33 check inter 2000q
+        #server node33 10.19.222.33:8080 cookie node33 check inter 2000
+
 backend qrnpci
         balance leastconn
 #        appsession JSESSIONID len 52 timeout 3h request-learn prefix
