@@ -220,6 +220,9 @@ backend ir-merchantapi
 backend bankswitch
         mode http
         cookie JSESSIONID prefix
+#        server node67 10.19.222.61:80 cookie node67 check inter 2000
+#        server node68 10.19.222.62:80 cookie node68 check inter 2000
+#        server node69 10.19.222.65:80 cookie node69 check inter 2000
         server node82 10.19.222.82:80 cookie node82 check inter 2000
         server node83 10.19.222.83:80 cookie node83 check inter 2000
         server node84 10.19.222.84:80 cookie node84 check inter 2000

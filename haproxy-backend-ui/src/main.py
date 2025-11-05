@@ -1,4 +1,3 @@
-# ...existing code...
 """
 Entrypoint: Streamlit web UI (default) and optional desktop GUI (--desktop).
 PyQt5 is imported lazily only when desktop mode is requested to avoid import errors
@@ -10,6 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import List, Tuple
+import os
+import hashlib
+from datetime import datetime
+import json
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CFG = (HERE.parent / "examples" / "haproxy.cfg").resolve()
@@ -57,9 +60,13 @@ def replace_backend(lines: List[str], backend_tuple: Tuple[str, int, int], new_t
 
 
 def backup_file(path: Path) -> Path:
-    bak = path.with_suffix(path.suffix + ".bak")
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # create backup in same directory with timestamp before .bak
+    bak = path.with_name(f"{path.name}.{ts}.bak")
     bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return bak
+
 
 
 def write_config(path: Path, lines: List[str]):
@@ -86,6 +93,94 @@ def try_restart_haproxy() -> Tuple[int, str]:
     return 127, "No suitable restart command found on this system."
 
 
+def _get_stored_credentials():
+    """
+    Return tuple: (admin_user, admin_password_spec, read_user, read_password_spec)
+    Environment variables:
+      - HAPROXY_UI_USER / HAPROXY_UI_PASSWORD      -> admin (legacy)
+      - HAPROXY_UI_READ_USER / HAPROXY_UI_READ_PASSWORD -> read-only user
+    Password spec may be plain or "sha256:<hex>"
+    """
+    admin_user = os.getenv("HAPROXY_UI_USER")
+    admin_pwd = os.getenv("HAPROXY_UI_PASSWORD")
+    read_user = os.getenv("HAPROXY_UI_READ_USER")
+    read_pwd = os.getenv("HAPROXY_UI_READ_PASSWORD")
+    return admin_user, admin_pwd, read_user, read_pwd
+
+
+def _check_password(plain_password: str, stored_spec: str | None) -> bool:
+    if stored_spec is None:
+        return True
+    if stored_spec.startswith("sha256:"):
+        expected = stored_spec.split(":", 1)[1]
+        return hashlib.sha256(plain_password.encode()).hexdigest() == expected
+    return plain_password == stored_spec
+
+
+def _authenticate(username: str, password: str) -> str | None:
+    """
+    Return role string ('admin' or 'read') if credentials match, otherwise None.
+    """
+    admin_user, admin_pwd, read_user, read_pwd = _get_stored_credentials()
+
+    # If no admin configured, auth is disabled -> treat as admin
+    if not admin_user and not read_user:
+        return "admin"
+
+    # Check admin
+    if admin_user and username == admin_user and _check_password(password, admin_pwd):
+        return "admin"
+
+    # Check read-only
+    if read_user and username == read_user and _check_password(password, read_pwd):
+        return "read"
+
+    return None
+
+
+def _require_login(st) -> bool:
+    """
+    Return True when the user is authenticated (or auth is disabled).
+    Stores role in st.session_state['haproxy_ui_role'].
+    """
+    admin_user, admin_pwd, read_user, read_pwd = _get_stored_credentials()
+    # no configured users -> no auth
+    if not admin_user and not read_user:
+        st.session_state.setdefault("haproxy_ui_role", "admin")
+        return True
+
+    if "haproxy_ui_auth" not in st.session_state:
+        st.session_state.haproxy_ui_auth = False
+        st.session_state.haproxy_ui_role = None
+        st.session_state.haproxy_ui_user = None
+
+    # already authenticated
+    if st.session_state.haproxy_ui_auth:
+        if st.sidebar.button("Logout"):
+            st.session_state.haproxy_ui_auth = False
+            st.session_state.haproxy_ui_role = None
+            st.session_state.haproxy_ui_user = None
+            st.experimental_rerun()
+        st.sidebar.markdown(f"Logged in as **{st.session_state.haproxy_ui_user}** ({st.session_state.haproxy_ui_role})")
+        return True
+
+    # show login form
+    st.sidebar.markdown("### Login")
+    username = st.sidebar.text_input("Username")
+    password = st.sidebar.text_input("Password", type="password")
+    if st.sidebar.button("Login"):
+        role = _authenticate(username, password)
+        if role:
+            st.session_state.haproxy_ui_auth = True
+            st.session_state.haproxy_ui_role = role
+            st.session_state.haproxy_ui_user = username
+            st.experimental_rerun()
+        else:
+            st.sidebar.error("Invalid username or password")
+
+    return False
+
+
 def make_streamlit_ui(config_path: Path):
     try:
         import streamlit as st
@@ -93,8 +188,20 @@ def make_streamlit_ui(config_path: Path):
         print("Streamlit is required for web UI. Install with: python3 -m pip install streamlit", file=sys.stderr)
         raise
 
+    # Require login first
+    if not _require_login(st):
+        st.title("HAProxy Backends Editor")
+        st.info("Please login using the form in the sidebar.")
+        return
+
+    # get role for UI controls
+    role = st.session_state.get("haproxy_ui_role", "admin")
+
     st.set_page_config(page_title="HAProxy Backends Editor", layout="wide")
     st.title("HAProxy Backends Editor")
+
+    if role == "read":
+        st.warning("You are logged in with read-only access. Editing, saving and restarting are disabled.")
 
     cfg_path = st.sidebar.text_input("Haproxy config path", str(config_path))
     cfg = Path(cfg_path)
@@ -111,31 +218,50 @@ def make_streamlit_ui(config_path: Path):
 
     names = [b[0] for b in backends]
     sel = st.selectbox("Select backend", names, index=0)
+
     selected_tuple = next(b for b in backends if b[0] == sel)
     backend_text = get_backend_text(lines, selected_tuple)
 
     st.subheader(f"Editing backend: {sel}")
-    edited = st.text_area("Backend contents", value=backend_text, height=300, key=f"backend_{sel}")
+    # disable editing for read-only users
+    edited = st.text_area("Backend contents", value=backend_text, height=300, key=f"backend_{sel}", disabled=(role != "admin"))
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Save changes"):
-            try:
-                backup = backup_file(cfg)
-                new_lines = replace_backend(lines, selected_tuple, edited)
-                write_config(cfg, new_lines)
-                st.success(f"Saved. Backup written to {backup}")
-            except Exception as exc:
-                st.error(f"Failed to save: {exc}")
+        # Save button disabled for read-only role
+        if st.button("Save changes", disabled=(role != "admin")):
+            if role != "admin":
+                st.error("You do not have permission to save changes.")
+            else:
+                try:
+                    old_text = backend_text
+                    new_text = edited
+                    
+                    if old_text != new_text:
+                        backup = backup_file(cfg)
+                        new_lines = replace_backend(lines, selected_tuple, new_text)
+                        write_config(cfg, new_lines)
+                        
+                        # Log the change
+                        username = st.session_state.get('haproxy_ui_user', 'unknown')
+                        log_change(cfg, sel, old_text, new_text, username)
+                        
+                        st.success(f"Saved and logged. Backup written to {backup}")
+                except Exception as exc:
+                    st.error(f"Failed to save: {exc}")
 
     with col2:
-        if st.button("Restart HAProxy"):
-            code, out = try_restart_haproxy()
-            if code == 0:
-                st.success("Restart/reload command succeeded.")
+        # Restart button disabled for read-only role
+        if st.button("Restart HAProxy", disabled=(role != "admin")):
+            if role != "admin":
+                st.error("You do not have permission to restart HAProxy.")
             else:
-                st.error(f"Restart command failed (code {code}). See output below.")
-            st.code(out)
+                code, out = try_restart_haproxy()
+                if code == 0:
+                    st.success("Restart/reload command succeeded.")
+                else:
+                    st.error(f"Restart command failed (code {code}). See output below.")
+                st.code(out)
 
     st.markdown("---")
     st.caption(f"Config path: {cfg} — {len(backends)} backend(s) found.")
@@ -243,11 +369,21 @@ def launch_desktop_editor(config_path: Path):
                 return
             try:
                 lines = read_config(self.cfg)
-                new_lines = replace_backend(lines, self.backends[idx], self.text.toPlainText())
-                backup_file(self.cfg)
-                write_config(self.cfg, new_lines)
-                QMessageBox.information(self, "Saved", "Backend saved. Backup created.")
-                self.load_config()
+                backend_name = self.backends[idx][0]
+                old_text = get_backend_text(lines, self.backends[idx])
+                new_text = self.text.toPlainText()
+                
+                # Only save if there are actual changes
+                if old_text != new_text:
+                    new_lines = replace_backend(lines, self.backends[idx], new_text)
+                    write_config(self.cfg, new_lines)
+                    
+                    # Log the change
+                    username = os.getenv('USER', 'unknown')  # For desktop UI
+                    log_change(self.cfg, backend_name, old_text, new_text, username)
+                    
+                    QMessageBox.information(self, "Saved", "Backend saved and change logged.")
+                    self.load_config()
             except Exception as exc:
                 QMessageBox.critical(self, "Error", f"Failed to save: {exc}")
 
@@ -263,6 +399,24 @@ def launch_desktop_editor(config_path: Path):
     win = EditorWindow(config_path)
     win.show()
     sys.exit(app.exec_())
+
+
+def log_change(config_path: Path, backend_name: str, old_text: str, new_text: str, username: str):
+    """Log configuration changes to an audit file next to the config."""
+    log_path = config_path.with_suffix('.audit.jsonl')
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "user": username,
+        "backend": backend_name,
+        "config_file": str(config_path),
+        "old_config": old_text,
+        "new_config": new_text
+    }
+    
+    # Append the log entry
+    with log_path.open('a') as f:
+        json.dump(entry, f)
+        f.write('\n')
 
 
 def main():
@@ -295,4 +449,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# ...existing code...
