@@ -184,6 +184,8 @@ def _require_login(st) -> bool:
 def make_streamlit_ui(config_path: Path):
     try:
         import streamlit as st
+        # Move page config to top, before any other st commands
+        st.set_page_config(page_title="HAProxy Backends Editor", layout="wide")
     except Exception:
         print("Streamlit is required for web UI. Install with: python3 -m pip install streamlit", file=sys.stderr)
         raise
@@ -197,7 +199,6 @@ def make_streamlit_ui(config_path: Path):
     # get role for UI controls
     role = st.session_state.get("haproxy_ui_role", "admin")
 
-    st.set_page_config(page_title="HAProxy Backends Editor", layout="wide")
     st.title("HAProxy Backends Editor")
 
     if role == "read":
@@ -449,3 +450,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+import os
+
+def _debug_show_env():
+    if os.getenv("HAPROXY_UI_DEBUG") == "1":
+        au, ap, ru, rp = _get_stored_credentials()
+        def mask(s):
+            if not s: return "<unset>"
+            return s if s.startswith("sha256:") else (s[0]+"*"*(len(s)-1))
+        print("DEBUG: admin_user=", au, "admin_pwd=", mask(ap), "read_user=", ru, "read_pwd=", mask(rp))
+
+# call once after _get_stored_credentials is defined (for debugging)
+_debug_show_env()
