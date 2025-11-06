@@ -229,10 +229,11 @@ def make_streamlit_ui(config_path: Path):
 
     col1, col2 = st.columns(2)
     with col1:
-        # Save button disabled for read-only role
         if st.button("Save changes", disabled=(role != "admin")):
             if role != "admin":
                 st.error("You do not have permission to save changes.")
+            elif not st.session_state.get("haproxy_ui_user"):
+                st.error("Authentication required to save changes.")
             else:
                 try:
                     old_text = backend_text
@@ -243,8 +244,8 @@ def make_streamlit_ui(config_path: Path):
                         new_lines = replace_backend(lines, selected_tuple, new_text)
                         write_config(cfg, new_lines)
                         
-                        # Log the change
-                        username = st.session_state.get('haproxy_ui_user', 'unknown')
+                        # Use authenticated username from session
+                        username = st.session_state.haproxy_ui_user
                         log_change(cfg, sel, old_text, new_text, username)
                         
                         st.success(f"Saved and logged. Backup written to {backup}")
