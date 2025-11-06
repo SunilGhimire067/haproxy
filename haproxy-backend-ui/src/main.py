@@ -184,21 +184,48 @@ def _require_login(st) -> bool:
 def make_streamlit_ui(config_path: Path):
     try:
         import streamlit as st
-        # Move page config to top, before any other st commands
-        st.set_page_config(page_title="HAProxy Backends Editor", layout="wide")
     except Exception:
         print("Streamlit is required for web UI. Install with: python3 -m pip install streamlit", file=sys.stderr)
         raise
 
-    # Require login first
-    if not _require_login(st):
+    # 1. Set page config first
+    st.set_page_config(page_title="HAProxy Backends Editor", layout="wide")
+
+    # 2. Initialize session state if needed
+    if "haproxy_ui_auth" not in st.session_state:
+        st.session_state.haproxy_ui_auth = False
+        st.session_state.haproxy_ui_role = None
+        st.session_state.haproxy_ui_user = None
+
+    # 3. Show login form if not authenticated
+    if not st.session_state.haproxy_ui_auth:
         st.title("HAProxy Backends Editor")
+        st.sidebar.markdown("### Login")
+        username = st.sidebar.text_input("Username", key="login_user")
+        password = st.sidebar.text_input("Password", type="password", key="login_pass")
+        if st.sidebar.button("Login"):
+            role = _authenticate(username, password)
+            if role:
+                st.session_state.haproxy_ui_auth = True
+                st.session_state.haproxy_ui_role = role
+                st.session_state.haproxy_ui_user = username
+                st.rerun()
+            else:
+                st.sidebar.error("Invalid username or password")
         st.info("Please login using the form in the sidebar.")
         return
 
-    # get role for UI controls
-    role = st.session_state.get("haproxy_ui_role", "admin")
+    # 4. Handle logout for authenticated users
+    st.sidebar.markdown(f"Logged in as **{st.session_state.haproxy_ui_user}** ({st.session_state.haproxy_ui_role})")
+    if st.sidebar.button("Logout"):
+        st.session_state.haproxy_ui_auth = False
+        st.session_state.haproxy_ui_role = None
+        st.session_state.haproxy_ui_user = None
+        st.rerun()
+        return
 
+    # 5. Main UI for authenticated users
+    role = st.session_state.haproxy_ui_role
     st.title("HAProxy Backends Editor")
 
     if role == "read":
@@ -229,11 +256,10 @@ def make_streamlit_ui(config_path: Path):
 
     col1, col2 = st.columns(2)
     with col1:
+        # Save button disabled for read-only role
         if st.button("Save changes", disabled=(role != "admin")):
             if role != "admin":
                 st.error("You do not have permission to save changes.")
-            elif not st.session_state.get("haproxy_ui_user"):
-                st.error("Authentication required to save changes.")
             else:
                 try:
                     old_text = backend_text
@@ -244,8 +270,8 @@ def make_streamlit_ui(config_path: Path):
                         new_lines = replace_backend(lines, selected_tuple, new_text)
                         write_config(cfg, new_lines)
                         
-                        # Use authenticated username from session
-                        username = st.session_state.haproxy_ui_user
+                        # Log the change
+                        username = st.session_state.get('haproxy_ui_user', 'unknown')
                         log_change(cfg, sel, old_text, new_text, username)
                         
                         st.success(f"Saved and logged. Backup written to {backup}")
