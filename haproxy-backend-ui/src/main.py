@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Tuple
 import os
 import hashlib
+import uuid
 from datetime import datetime
 import json
 
@@ -95,17 +96,32 @@ def try_restart_haproxy() -> Tuple[int, str]:
 
 def _get_stored_credentials():
     """
-    Return tuple: (admin_user, admin_password_spec, read_user, read_password_spec)
-    Environment variables:
-      - HAPROXY_UI_USER / HAPROXY_UI_PASSWORD      -> admin (legacy)
-      - HAPROXY_UI_READ_USER / HAPROXY_UI_READ_PASSWORD -> read-only user
-    Password spec may be plain or "sha256:<hex>"
+    Return (admin_users, read_user, read_password_spec)
+    admin_users: list of (username, password_spec)
+    Supports environment variables:
+      - HAPROXY_UI_ADMIN1_USER / HAPROXY_UI_ADMIN1_PASSWORD
+      - HAPROXY_UI_ADMIN2_USER / HAPROXY_UI_ADMIN2_PASSWORD
+    Backwards compatible with:
+      - HAPROXY_UI_USER / HAPROXY_UI_PASSWORD
     """
-    admin_user = os.getenv("HAPROXY_UI_USER")
-    admin_pwd = os.getenv("HAPROXY_UI_PASSWORD")
+    admin_users = []
+    a1u = os.getenv("HAPROXY_UI_ADMIN1_USER")
+    a1p = os.getenv("HAPROXY_UI_ADMIN1_PASSWORD")
+    a2u = os.getenv("HAPROXY_UI_ADMIN2_USER")
+    a2p = os.getenv("HAPROXY_UI_ADMIN2_PASSWORD")
+    # legacy
+    lu = os.getenv("HAPROXY_UI_USER")
+    lp = os.getenv("HAPROXY_UI_PASSWORD")
+    if a1u:
+        admin_users.append((a1u, a1p))
+    if a2u:
+        admin_users.append((a2u, a2p))
+    # fallback to single legacy admin if no admin1/admin2 provided
+    if not admin_users and lu:
+        admin_users.append((lu, lp))
     read_user = os.getenv("HAPROXY_UI_READ_USER")
     read_pwd = os.getenv("HAPROXY_UI_READ_PASSWORD")
-    return admin_user, admin_pwd, read_user, read_pwd
+    return admin_users, read_user, read_pwd
 
 
 def _check_password(plain_password: str, stored_spec: str | None) -> bool:
@@ -120,16 +136,18 @@ def _check_password(plain_password: str, stored_spec: str | None) -> bool:
 def _authenticate(username: str, password: str) -> str | None:
     """
     Return role string ('admin' or 'read') if credentials match, otherwise None.
+    Supports multiple admin users.
     """
-    admin_user, admin_pwd, read_user, read_pwd = _get_stored_credentials()
+    admin_users, read_user, read_pwd = _get_stored_credentials()
 
     # If no admin configured, auth is disabled -> treat as admin
-    if not admin_user and not read_user:
+    if not admin_users and not read_user:
         return "admin"
 
-    # Check admin
-    if admin_user and username == admin_user and _check_password(password, admin_pwd):
-        return "admin"
+    # Check admin list
+    for u, pwd_spec in admin_users:
+        if username == u and _check_password(password, pwd_spec):
+            return "admin"
 
     # Check read-only
     if read_user and username == read_user and _check_password(password, read_pwd):
@@ -143,9 +161,9 @@ def _require_login(st) -> bool:
     Return True when the user is authenticated (or auth is disabled).
     Stores role in st.session_state['haproxy_ui_role'].
     """
-    admin_user, admin_pwd, read_user, read_pwd = _get_stored_credentials()
+    admin_users, read_user, read_pwd = _get_stored_credentials()
     # no configured users -> no auth
-    if not admin_user and not read_user:
+    if not admin_users and not read_user:
         st.session_state.setdefault("haproxy_ui_role", "admin")
         return True
 
@@ -237,6 +255,17 @@ def make_streamlit_ui(config_path: Path):
         st.sidebar.error(f"Config file not found: {cfg}")
         return
 
+    # show pending changes area for admins
+    admin_users, _, _ = _get_stored_credentials()
+    pending = load_pending_changes(cfg)
+    if role == "admin":
+        st.sidebar.markdown("### Pending changes")
+        if pending:
+            for p in pending:
+                st.sidebar.markdown(f"- {p['id'][:8]} | backend: **{p['backend']}** | proposer: {p['proposer']} | {p['timestamp']}")
+        else:
+            st.sidebar.markdown("_No pending changes_")
+
     lines = read_config(cfg)
     backends = find_backends(lines)
     if not backends:
@@ -251,32 +280,39 @@ def make_streamlit_ui(config_path: Path):
     backend_text = get_backend_text(lines, selected_tuple)
 
     st.subheader(f"Editing backend: {sel}")
+
+    # If there's a pending proposal for this backend, offer to load it into the editor
+    pending_for_backend = next((p for p in pending if p.get("backend") == sel and p.get("status") == "pending"), None)
+    if pending_for_backend:
+        st.info(f"Pending proposal by {pending_for_backend['proposer']} created {pending_for_backend['timestamp']}")
+        if st.button("Load pending proposal into editor", key=f"load_pending_{sel}"):
+            # populate session state so the text_area shows the pending content
+            st.session_state[f"backend_{sel}"] = pending_for_backend["new_config"]
+
     # disable editing for read-only users
-    edited = st.text_area("Backend contents", value=backend_text, height=300, key=f"backend_{sel}", disabled=(role != "admin"))
+    editor_key = f"backend_{sel}"
+    initial_value = st.session_state.get(editor_key, backend_text)
+    edited = st.text_area("Backend contents", value=initial_value, height=300, key=editor_key, disabled=(role != "admin"))
 
     col1, col2 = st.columns(2)
     with col1:
-        # Save button disabled for read-only role
-        if st.button("Save changes", disabled=(role != "admin")):
+        # Save button behavior changed: create pending change instead of immediate write
+        if st.button("Propose changes (create pending)", disabled=(role != "admin")):
             if role != "admin":
                 st.error("You do not have permission to save changes.")
             else:
                 try:
                     old_text = backend_text
                     new_text = edited
-                    
+
                     if old_text != new_text:
-                        backup = backup_file(cfg)
-                        new_lines = replace_backend(lines, selected_tuple, new_text)
-                        write_config(cfg, new_lines)
-                        
-                        # Log the change
                         username = st.session_state.get('haproxy_ui_user', 'unknown')
-                        log_change(cfg, sel, old_text, new_text, username)
-                        
-                        st.success(f"Saved and logged. Backup written to {backup}")
+                        entry = create_pending_change(cfg, sel, old_text, new_text, username)
+                        st.success(f"Pending change created (id {entry['id'][:8]}). It requires approval by another admin before being applied.")
+                    else:
+                        st.info("No changes detected.")
                 except Exception as exc:
-                    st.error(f"Failed to save: {exc}")
+                    st.error(f"Failed to create pending change: {exc}")
 
     with col2:
         # Restart button disabled for read-only role
@@ -292,9 +328,44 @@ def make_streamlit_ui(config_path: Path):
                 st.code(out)
 
     st.markdown("---")
-    st.caption(f"Config path: {cfg} — {len(backends)} backend(s) found.")
-    if st.checkbox("Show raw config (first 400 lines)"):
-        st.code("\n".join(read_config(cfg)[:400]))
+    # Pending changes management panel for admins (approve/reject)
+    if role == "admin" and pending:
+        st.header("Pending changes (approval)")
+        # list selectable pending entries
+        sel_id = st.selectbox("Select pending change", [f"{p['id']} | backend: {p['backend']} | proposer: {p['proposer']}" for p in pending])
+        chosen_id = sel_id.split(" | ")[0]
+        chosen = next(p for p in pending if p['id'] == chosen_id)
+        st.markdown(f"**Pending id:** {chosen['id']}")
+        st.markdown(f"**Backend:** {chosen['backend']}")
+        st.markdown(f"**Proposer:** {chosen['proposer']}")
+        st.markdown(f"**Created:** {chosen['timestamp']}")
+        st.subheader("Old configuration")
+        st.code(chosen['old_config'])
+        st.subheader("Proposed new configuration")
+        st.code(chosen['new_config'])
+
+        approver = st.session_state.get('haproxy_ui_user', 'unknown')
+        if approver == chosen['proposer']:
+            st.warning("You proposed this change; you cannot approve/reject your own change.")
+        else:
+            apcol1, apcol2 = st.columns(2)
+            with apcol1:
+                if st.button("Approve change"):
+                    ok, msg = approve_pending_change(cfg, chosen['id'], approver)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                    st.experimental_rerun()
+            with apcol2:
+                if st.button("Reject change"):
+                    reason = st.text_input("Rejection reason (optional)", key=f"rej_{chosen['id']}")
+                    ok, msg = reject_pending_change(cfg, chosen['id'], approver, reason or "")
+                    if ok:
+                        st.success("Change rejected.")
+                    else:
+                        st.error(msg)
+                    st.experimental_rerun()
 
 
 def launch_desktop_editor(config_path: Path):
@@ -401,16 +472,12 @@ def launch_desktop_editor(config_path: Path):
                 old_text = get_backend_text(lines, self.backends[idx])
                 new_text = self.text.toPlainText()
                 
-                # Only save if there are actual changes
+                # Only create pending if there are actual changes
                 if old_text != new_text:
-                    new_lines = replace_backend(lines, self.backends[idx], new_text)
-                    write_config(self.cfg, new_lines)
-                    
-                    # Log the change
+                    # For desktop UI we create a pending change (approval in web UI)
                     username = os.getenv('USER', 'unknown')  # For desktop UI
-                    log_change(self.cfg, backend_name, old_text, new_text, username)
-                    
-                    QMessageBox.information(self, "Saved", "Backend saved and change logged.")
+                    create_pending_change(self.cfg, backend_name, old_text, new_text, username)
+                    QMessageBox.information(self, "Pending created", "Pending change created. It requires approval by another admin via the web UI.")
                     self.load_config()
             except Exception as exc:
                 QMessageBox.critical(self, "Error", f"Failed to save: {exc}")
@@ -445,6 +512,121 @@ def log_change(config_path: Path, backend_name: str, old_text: str, new_text: st
     with log_path.open('a') as f:
         json.dump(entry, f)
         f.write('\n')
+
+
+def _pending_path(config_path: Path) -> Path:
+    return config_path.with_suffix('.pending.jsonl')
+
+def load_pending_changes(config_path: Path) -> list:
+    p = _pending_path(config_path)
+    if not p.exists():
+        return []
+    entries = []
+    with p.open('r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    return entries
+
+def write_pending_changes(config_path: Path, entries: list):
+    p = _pending_path(config_path)
+    with p.open('w', encoding='utf-8') as f:
+        for e in entries:
+            json.dump(e, f)
+            f.write('\n')
+
+def create_pending_change(config_path: Path, backend_name: str, old_text: str, new_text: str, proposer: str) -> dict:
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.now().isoformat(),
+        "proposer": proposer,
+        "backend": backend_name,
+        "config_file": str(config_path),
+        "old_config": old_text,
+        "new_config": new_text,
+        "status": "pending",
+        "approver": None,
+        "approved_at": None,
+        "rejection_reason": None
+    }
+    entries = load_pending_changes(config_path)
+    entries.append(entry)
+    write_pending_changes(config_path, entries)
+    return entry
+
+def approve_pending_change(config_path: Path, entry_id: str, approver: str) -> tuple[bool, str]:
+    entries = load_pending_changes(config_path)
+    idx = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), None)
+    if idx is None:
+        return False, "Pending entry not found."
+    entry = entries[idx]
+    if entry.get("proposer") == approver:
+        return False, "You cannot approve your own change."
+    # verify current file still matches old_config
+    try:
+        lines = read_config(config_path)
+        backends = find_backends(lines)
+        target = next((b for b in backends if b[0] == entry["backend"]), None)
+        if target is None:
+            return False, f"Backend {entry['backend']} not found in current config."
+        current_text = get_backend_text(lines, target)
+        if current_text != entry["old_config"]:
+            return False, "Current backend config differs from the pending change's 'old' config. Manual intervention required."
+        # apply
+        backup = backup_file(config_path)
+        new_lines = replace_backend(lines, target, entry["new_config"])
+        write_config(config_path, new_lines)
+        # mark approved
+        entry["status"] = "approved"
+        entry["approver"] = approver
+        entry["approved_at"] = datetime.now().isoformat()
+        # persist pending list without this entry
+        entries.pop(idx)
+        write_pending_changes(config_path, entries)
+        # write audit
+        log_change(config_path, entry["backend"], entry["old_config"], entry["new_config"], entry["proposer"])
+        # append approval meta to audit file as well
+        audit_path = config_path.with_suffix('.audit.jsonl')
+        approval_record = {
+            "timestamp": datetime.now().isoformat(),
+            "action": "approved",
+            "approver": approver,
+            "pending_id": entry["id"],
+            "config_file": str(config_path),
+            "backend": entry["backend"]
+        }
+        with audit_path.open('a', encoding='utf-8') as f:
+            json.dump(approval_record, f)
+            f.write('\n')
+        return True, f"Approved and applied. Backup written to {backup}"
+    except Exception as exc:
+        return False, f"Failed to apply pending change: {exc}"
+
+def reject_pending_change(config_path: Path, entry_id: str, approver: str, reason: str = "") -> tuple[bool, str]:
+    entries = load_pending_changes(config_path)
+    idx = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), None)
+    if idx is None:
+        return False, "Pending entry not found."
+    entry = entries[idx]
+    if entry.get("proposer") == approver:
+        return False, "You cannot reject your own change."
+    entry["status"] = "rejected"
+    entry["approver"] = approver
+    entry["approved_at"] = datetime.now().isoformat()
+    entry["rejection_reason"] = reason
+    # remove from pending and write to audit
+    entries.pop(idx)
+    write_pending_changes(config_path, entries)
+    audit_path = config_path.with_suffix('.audit.jsonl')
+    with audit_path.open('a', encoding='utf-8') as f:
+        json.dump({"timestamp": datetime.now().isoformat(), "action": "rejected", "approver": approver, "reason": reason, "pending_id": entry["id"], "backend": entry["backend"]}, f)
+        f.write('\n')
+    return True, "Rejected and recorded."
 
 
 def main():
@@ -482,11 +664,12 @@ import os
 
 def _debug_show_env():
     if os.getenv("HAPROXY_UI_DEBUG") == "1":
-        au, ap, ru, rp = _get_stored_credentials()
+        admins, ru, rp = _get_stored_credentials()
         def mask(s):
             if not s: return "<unset>"
-            return s if s.startswith("sha256:") else (s[0]+"*"*(len(s)-1))
-        print("DEBUG: admin_user=", au, "admin_pwd=", mask(ap), "read_user=", ru, "read_pwd=", mask(rp))
+            return s if isinstance(s, str) and s.startswith("sha256:") else (s[0]+"*"*(len(s)-1))
+        admin_names = [u for u, _ in admins]
+        print("DEBUG: admins=", admin_names, "read_user=", ru, "read_pwd=", mask(rp))
 
 # call once after _get_stored_credentials is defined (for debugging)
 _debug_show_env()
