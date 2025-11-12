@@ -138,7 +138,8 @@ backend qrbackend
         cookie JSESSIONID prefix
         server node1 10.31.213.3:80 cookie node13 check inter 2000
         #server node13 10.19.222.13:8080 cookie node13 check inter 2000
-        #server node33 10.19.222.33:8080 cookie node33 check inter 2000sda
+        #server node33 10.19.222.33:8080 cookie node33 check inter 2000
+
 backend qrbackend-esewa
         mode http
         balance leastconn
